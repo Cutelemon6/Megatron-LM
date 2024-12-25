@@ -16,7 +16,7 @@ from megatron.core.parallel_state import get_context_parallel_group, get_context
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_batch_on_this_cp_rank, log_single_rank
+from megatron.core.utils import log_single_rank
 
 try:
     import transformer_engine  # pylint: disable=unused-import
@@ -36,6 +36,7 @@ IGNORE_INDEX = -100  # ID for labels that should be ignored.
 # Image token index can be tokenizer dependent so the default value does not work in all cases.
 DEFAULT_IMAGE_TOKEN_INDEX = -200
 IMAGE_TOKEN = "<image>"
+VIDEO_TOKEN = "<video>"
 
 
 # Note: This is under development and may be missing features.
@@ -636,6 +637,8 @@ class LLaVAModel(MegatronModule):
 
         if self.context_parallel_lm > 1:
             # Distribute sequence across CP ranks
+            from megatron.training.utils import get_batch_on_this_cp_rank
+
             batch = get_batch_on_this_cp_rank(
                 {
                     "combined_embeddings": combined_embeddings,

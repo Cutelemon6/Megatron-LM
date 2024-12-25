@@ -3,10 +3,13 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
+  GPUS_PER_NODE: 8
 MODEL_ARGS:
   --num-layers: 12
-  --hidden-size: 512
-  --num-attention-heads: 8
+  --hidden-size: 624
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --num-attention-heads: 12
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
@@ -16,15 +19,14 @@ MODEL_ARGS:
   --global-batch-size: 32
   --seq-length: 1024
   --max-position-embeddings: 1024
-  --train-iters: 100
+  --train-iters: 50
   --timing-log-level: 2
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_PATH}
   --load: ${CHECKPOINT_PATH}
-  --data-path: ${DATA_PATH}/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/bpe/merges.txt
   --split: 949,50,1
+  --tokenizer-type: NullTokenizer
+  --vocab-size: 8192
   --distributed-backend: nccl
   --lr: 0.00015
   --lr-decay-style: cosine
@@ -33,20 +35,24 @@ MODEL_ARGS:
   --clip-grad: 1.0
   --lr-warmup-fraction: .01
   --log-interval: 1
-  --save-interval: 50
+  --save-interval: 10000
   --eval-interval: 1000
   --eval-iters: 10
   --transformer-impl: transformer_engine
-  --tensor-model-parallel-size: 1
-  --pipeline-model-parallel-size: 2
-  --position-embedding-type: rope
-  --no-ckpt-fully-parallel-save: true
+  --tensor-model-parallel-size: 4
+  --pipeline-model-parallel-size: 1
+  --encoder-pipeline-model-parallel-size: 1
+  --encoder-tensor-model-parallel-size: 4
   --deterministic-mode: true
-  --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
-  --use-checkpoint-opt_param-scheduler: true
-  --use-mcore-models: true
-  --ckpt-format: torch_dist
-  --data-cache-path: ${DATA_CACHE_PATH}
+  --ckpt-format: torch
+  --no-gradient-accumulation-fusion: true
   --bf16: true
-TEST_TYPE: ckpt-resume
+  --img-h: 336
+  --img-w: 336
+  --patch-dim: 14
+  --mock-data: true
+  --freeze-ViT: true
+  --freeze-LM: true
+  --use-distributed-optimizer: true
+TEST_TYPE: regular
