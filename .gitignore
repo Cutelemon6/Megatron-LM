@@ -9,3 +9,5 @@ logs
 .vscode
 local/
 .gitmodules
+megatron-exp
+train_gpt3_distributed.sh

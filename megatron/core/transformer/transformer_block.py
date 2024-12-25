@@ -241,6 +241,7 @@ class TransformerBlock(MegatronModule):
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
+        print(f'[exp info] in transformer_block.py, self.layers={self.layers}')
 
         # @TODO: add back standalone_embedding_stage (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
