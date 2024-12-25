@@ -274,6 +274,17 @@ def pretrain(
         get_position_embedding_ranks=get_position_embedding_ranks
     )
 
+    # experiment info
+    import torch.distributed as dist
+    assert dist.is_initialized(), '[exp error] distributed environment is not initialized\n'
+    print(f'[exp info]: \n\
+        global rank={dist.get_rank()}, \n\
+        device name={torch.cuda.get_device_name()}, \n\
+        belonged data parallel ranks={dist.get_process_group_ranks(group=mpu.get_data_parallel_group())}, \n\
+        belonged model parallel ranks={dist.get_process_group_ranks(group=mpu.get_model_parallel_group())}, \n\
+        belonged pipeline model parallel ranks={dist.get_process_group_ranks(group=mpu.get_pipeline_model_parallel_group())} \n\
+        belonged tensor model parallel ranks={dist.get_process_group_ranks(group=mpu.get_tensor_model_parallel_group())}\n')
+    
     args = get_args()
     timers = get_timers()
 

@@ -360,6 +360,13 @@ class RankGenerator(object):
             for rank_group in ranks:
                 for i in range(len(rank_group)):
                     rank_group[i] += self.rank_offset
+        
+        # latter rank do early stages
+        print(f'[exp info] in parallel.py, get_ranks, ranks: {ranks}')
+        for rank_group in ranks:
+                for i in range(len(rank_group)):
+                    rank_group[i] = (rank_group[i] + 2) % self.world_size
+        print(f'[exp info] after adding offset, in parallel.py, get_ranks, ranks: {ranks}')
         return ranks
 
 
@@ -678,11 +685,13 @@ def initialize_model_parallel(
         else:
             d_ranks = decoder_rank_generator.get_ranks(group_type, **kwargs)
 
+        print(f'[exp info] in parallel.py, generator_wrapper, encoder_rank_generator: {encoder_rank_generator}')
         if encoder_rank_generator is None:
             for x in d_ranks:
                 yield x
             return
         e_ranks = encoder_rank_generator.get_ranks(group_type, **kwargs)
+        print(f'[exp info] in parallel.py, generator_wrapper, rank={torch.distributed.get_rank()}, group_type:{group_type}, is_expert:{is_expert}, kwargs:{kwargs}, e_ranks: {e_ranks}, d_ranks: {d_ranks}')
         if group_type == 'pp':
             # Map 1 encoder tp rank to several decoder tp ranks, because
             # these won't be the same size.
