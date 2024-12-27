@@ -360,13 +360,6 @@ class RankGenerator(object):
             for rank_group in ranks:
                 for i in range(len(rank_group)):
                     rank_group[i] += self.rank_offset
-        
-        # latter rank do early stages
-        print(f'[exp info] in parallel.py, get_ranks, ranks: {ranks}')
-        for rank_group in ranks:
-                for i in range(len(rank_group)):
-                    rank_group[i] = (rank_group[i] + 2) % self.world_size
-        print(f'[exp info] after adding offset, in parallel.py, get_ranks, ranks: {ranks}')
         return ranks
 
 
