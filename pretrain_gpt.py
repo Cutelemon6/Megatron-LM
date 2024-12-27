@@ -231,6 +231,7 @@ def forward_step(data_iterator, model: GPTModel):
 
 
 def is_dataset_built_on_rank():
+    print(f'in pretrain_gpt.py, is_dataset_built_on_rank(), rank={torch.distributed.get_rank()}, mpu.is_pipeline_first_stage()={mpu.is_pipeline_first_stage()}, mpu.is_pipeline_last_stage()={mpu.is_pipeline_last_stage()}, mpu.get_tensor_model_parallel_rank()={mpu.get_tensor_model_parallel_rank()}')
     return (
         mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
     ) and mpu.get_tensor_model_parallel_rank() == 0

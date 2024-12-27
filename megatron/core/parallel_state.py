@@ -685,13 +685,13 @@ def initialize_model_parallel(
         else:
             d_ranks = decoder_rank_generator.get_ranks(group_type, **kwargs)
 
-        print(f'[exp info] in parallel.py, generator_wrapper, encoder_rank_generator: {encoder_rank_generator}')
+        print(f'[exp info] in parallel.py, generator_wrapper, rank={torch.distributed.get_rank()}, encoder_rank_generator: {encoder_rank_generator}, d_ranks: {d_ranks}, group_type:{group_type}, is_expert:{is_expert}, kwargs:{kwargs}')
         if encoder_rank_generator is None:
             for x in d_ranks:
                 yield x
             return
         e_ranks = encoder_rank_generator.get_ranks(group_type, **kwargs)
-        print(f'[exp info] in parallel.py, generator_wrapper, rank={torch.distributed.get_rank()}, group_type:{group_type}, is_expert:{is_expert}, kwargs:{kwargs}, e_ranks: {e_ranks}, d_ranks: {d_ranks}')
+        print(f'[exp info] in parallel.py, generator_wrapper, rank={torch.distributed.get_rank()}, e_ranks: {e_ranks}')
         if group_type == 'pp':
             # Map 1 encoder tp rank to several decoder tp ranks, because
             # these won't be the same size.
@@ -849,6 +849,7 @@ def initialize_model_parallel(
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
             _MODEL_PARALLEL_GLOBAL_RANKS = ranks
+            print(f'[exp info] in parallel.py, initialize_model_parallel, global rank={torch.distributed.get_rank()}, rank={rank}, _MODEL_PARALLEL_GROUP: {group}, _MODEL_PARALLEL_GLOBAL_RANKS: {ranks}, group corresponding ranks: {torch.distributed.get_process_group_ranks(group)}')
 
     # Build the tensor model-parallel groups.
     global _TENSOR_MODEL_PARALLEL_GROUP
@@ -1259,6 +1260,7 @@ def get_tensor_model_parallel_rank():
 def get_pipeline_model_parallel_rank():
     """Return caller's rank for the pipeline-model-parallel group."""
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
+    print(f'[exp info] in parallel.py, get_pipeline_model_parallel_rank, rank={torch.distributed.get_rank()}, _MPU_PIPELINE_MODEL_PARALLEL_RANK: {_MPU_PIPELINE_MODEL_PARALLEL_RANK}')
     if _MPU_PIPELINE_MODEL_PARALLEL_RANK is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_RANK
     rank = torch.distributed.get_rank()

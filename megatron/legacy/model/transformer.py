@@ -1553,7 +1553,7 @@ class ParallelTransformer(MegatronModule):
                     offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
             else:
                 offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
-            print(f'[exp info] global rank={torch.distributed.get_rank()}, device name={torch.cuda.get_device_name()}\n    in class {self.__class__.__name__}, offset={offset}\n, num_layers={self.num_layers},\n    allocated layers=[{offset + 1}, {offset + self.num_layers}]')
+            print(f'[exp info] global rank={torch.distributed.get_rank()}, device name={torch.cuda.get_device_name()}\n    in class {self.__class__.__name__}, offset={offset}, num_layers={self.num_layers},\n    allocated layers=[{offset + 1}, {offset + self.num_layers}], total layers={config.num_layers}')
 
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,
