@@ -1273,9 +1273,14 @@ def get_pipeline_model_parallel_rank():
                 if r == rank:
                     indices.append(i)
         assert all(x == indices[0] for x in indices)
-        return torch.distributed.get_rank(group=pp_group[0])
+        # return torch.distributed.get_rank(group=pp_group[0])
+        return indices[0]
     else:
-        return torch.distributed.get_rank(group=pp_group)
+        # return torch.distributed.get_rank(group=pp_group)
+        assert isinstance(_PIPELINE_GLOBAL_RANKS, list), f'_PIPELINE_GLOBAL_RANKS should be a list of int, getting _PIPELINE_GLOBAL_RANKS type={type(_PIPELINE_GLOBAL_RANKS)}'
+        assert isinstance(_PIPELINE_GLOBAL_RANKS[0], int), f'_PIPELINE_GLOBAL_RANKS should be a list of int, getting _PIPELINE_GLOBAL_RANKS[0] type={type(_PIPELINE_GLOBAL_RANKS[0])}'
+        # return index of rank k which _PIPELINE_GLOBAL_RANKS[k] == rank
+        return _PIPELINE_GLOBAL_RANKS.index(rank)
 
 
 def get_pipeline_model_parallel_split_rank():
