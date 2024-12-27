@@ -16,6 +16,7 @@ from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split
 from megatron.core.datasets.utils_s3 import S3Config, is_s3_path
 from megatron.core.utils import log_single_rank
+from megatron.core import mpu
 
 logger = logging.getLogger(__name__)
 
@@ -351,7 +352,7 @@ class GPTDataset(MegatronDataset):
 
         if not path_to_cache or (
             not cache_hit
-            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == mpu.get_pipeline_model_parallel_first_rank())
         ):
 
             log_single_rank(

@@ -15,6 +15,7 @@ from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.utils import Split
 from megatron.core.utils import log_single_rank
+from megatron.core import mpu
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +164,7 @@ class MaskedWordPieceDataset(MegatronDataset):
         else:
             num_epochs = 1
 
-        if not cache_hit and torch.distributed.get_rank() == 0:
+        if not cache_hit and torch.distributed.get_rank() == mpu.get_pipeline_model_parallel_first_rank():
             log_single_rank(
                 logger,
                 logging.INFO,

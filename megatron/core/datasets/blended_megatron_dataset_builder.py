@@ -14,6 +14,7 @@ from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDat
 from megatron.core.datasets.utils import Split, normalize
 from megatron.core.parallel_state import get_virtual_pipeline_model_parallel_rank
 from megatron.core.utils import log_single_rank
+from megatron.core import mpu
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +75,10 @@ class BlendedMegatronDatasetBuilder(object):
         if torch.distributed.is_initialized():
             gb_rank = torch.distributed.get_rank()
             vp_rank = get_virtual_pipeline_model_parallel_rank()
-            if gb_rank == 0 and (vp_rank == 0 or vp_rank is None):
+            if gb_rank == mpu.get_pipeline_model_parallel_first_rank() and (vp_rank == 0 or vp_rank is None):
                 assert (
                     self.is_built_on_rank()
-                ), "is_built_on_rank must return True when global rank = 0 and vp rank = 0"
+                ), "is_built_on_rank must return True when global rank = mpu.get_pipeline_model_parallel_first_rank() and vp rank = 0"
 
     def build(self) -> List[Optional[TopLevelDataset]]:
         """Build all dataset splits according to the provided blend(s)
@@ -355,7 +356,7 @@ class BlendedMegatronDatasetBuilder(object):
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
             # First, build on rank 0
-            if rank == 0:
+            if rank == mpu.get_pipeline_model_parallel_first_rank():
                 num_workers = num_dataset_builder_threads
                 if num_workers > 1:
                     # since only rank 0 is running, scale up the thread count
@@ -370,7 +371,7 @@ class BlendedMegatronDatasetBuilder(object):
             torch.distributed.barrier()
 
             # Then, build on other ranks; guaranteed to be data_cache hit
-            if rank != 0:
+            if rank != mpu.get_pipeline_model_parallel_first_rank():
                 _threading_helper(
                     megatron_datasets,
                     num_dataset_builder_threads,
@@ -480,7 +481,7 @@ class BlendedMegatronDatasetBuilder(object):
             dataset = None
 
             # First, build on rank 0
-            if rank == 0 and is_built_on_rank():
+            if rank == mpu.get_pipeline_model_parallel_first_rank() and is_built_on_rank():
                 try:
                     dataset = cls(*args)
                 except OSError as err:
@@ -496,7 +497,7 @@ class BlendedMegatronDatasetBuilder(object):
                 torch.distributed.barrier()
 
             # After, build on other ranks
-            if rank != 0 and is_built_on_rank():
+            if rank != mpu.get_pipeline_model_parallel_first_rank() and is_built_on_rank():
                 dataset = cls(*args)
 
             return dataset
