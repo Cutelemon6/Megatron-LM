@@ -442,7 +442,7 @@ def main():
     )
 
     # ──────────────────────────────────────────────────
-    # Initialize Megatron parallel state
+    # Initialize Megatron parallel state and RNG tracker
     # ──────────────────────────────────────────────────
     with record_timing("init.parallel_state", nvtx_color="blue"):
         from megatron.core import parallel_state as mpu
@@ -451,6 +451,12 @@ def main():
             tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=pp_size,
         )
+
+        # Set up the RNG tracker for model parallel (required by VocabParallelEmbedding)
+        from megatron.core.tensor_parallel import get_cuda_rng_tracker
+        rng_tracker = get_cuda_rng_tracker()
+        rng_seed = 1234 + rank  # Different seed per rank, matching Megatron convention
+        rng_tracker.add("model-parallel-rng", rng_seed)
 
         logger.info(
             "Parallel state initialized: tp_rank=%d pp_rank=%d dp_rank=%d",
