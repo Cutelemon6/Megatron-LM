@@ -47,6 +47,27 @@ logging.basicConfig(
 )
 
 
+def _patch_mcore_no_te():
+    """Patch Megatron's gpt_layer_specs to avoid requiring Transformer Engine.
+
+    This mirrors the VERL_FORCE_NO_TE_MCORE sitecustomize patch.
+    When TE is not installed, get_gpt_decoder_block_spec tries to reference
+    TENorm which causes a NameError. We patch it to always pass
+    use_transformer_engine=False.
+    """
+    try:
+        from megatron.core.models.gpt import gpt_layer_specs as specs_mod
+        if not hasattr(specs_mod, "_profile_no_te_patched"):
+            _orig_get_spec = specs_mod.get_gpt_decoder_block_spec
+            def _get_spec_no_te(config, use_transformer_engine=True, *args, **kwargs):
+                return _orig_get_spec(config, use_transformer_engine=False, *args, **kwargs)
+            specs_mod.get_gpt_decoder_block_spec = _get_spec_no_te
+            specs_mod._profile_no_te_patched = True
+            logger.info("Patched mcore gpt_layer_specs to use_transformer_engine=False")
+    except ImportError:
+        pass
+
+
 # ──────────────────────────────────────────────────
 # Timing helpers (mirroring verl's observability.py)
 # ──────────────────────────────────────────────────
@@ -404,6 +425,12 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
 
     torch.cuda.set_device(local_rank)
+
+    # ──────────────────────────────────────────────────
+    # Patch mcore to not require Transformer Engine
+    # (same effect as VERL_FORCE_NO_TE_MCORE sitecustomize)
+    # ──────────────────────────────────────────────────
+    _patch_mcore_no_te()
 
     tp_size = args.tensor_model_parallel_size
     pp_size = args.pipeline_model_parallel_size

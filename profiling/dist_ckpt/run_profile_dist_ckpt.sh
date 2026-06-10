@@ -39,6 +39,8 @@ export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export PYTHONUNBUFFERED=1
+export VERL_FORCE_NO_TE_MCORE=1
+export PYTHONPATH=/workspace/runtime_shims/no_te_mcore:${PYTHONPATH:-}
 
 if [[ -d "${VENV_DIR}" ]]; then
   source "${VENV_DIR}/bin/activate"
