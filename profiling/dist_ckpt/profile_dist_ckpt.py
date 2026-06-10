@@ -43,7 +43,7 @@ import torch
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(rank)s %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
 
@@ -422,7 +422,6 @@ def main():
         mpu.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=pp_size,
-            data_parallel_size=dp_size,
         )
 
         logger.info(
