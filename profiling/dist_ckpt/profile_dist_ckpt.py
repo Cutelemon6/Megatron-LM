@@ -248,10 +248,11 @@ def initialize_model_from_hf(model_path, tp_size, pp_size):
 
     with record_timing("init.bridge_from_hf", nvtx_color="blue"):
         bridge = AutoBridge.from_pretrained(model_path)
-        # Override for no-TE/unfused profile setup (matching verl's DAPO smoke config)
+        # Override for unfused attention, no TE, no sequence parallel
+        # (matching verl's DAPO smoke config, but use_transformer_engine
+        # is not a TransformerConfig parameter in mcore 0.13.0)
         bridge.set_extra_args(
             attention_backend="unfused",
-            use_transformer_engine=False,
             sequence_parallel=False,
         )
 
