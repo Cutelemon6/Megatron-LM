@@ -263,6 +263,10 @@ def initialize_model_from_hf(model_path, tp_size, pp_size):
     2. Override attention backend to unfused, disable TE
     3. Build Megatron model via bridge.get_model()
     4. Load HF weights via bridge.load_weights()
+
+    NOTE: For profiling dist save/load, actual weight values don't matter.
+    We can optionally skip weight loading and use random init to avoid
+    mbridge version compatibility issues.
     """
     from megatron.core import parallel_state as mpu
     from mbridge import AutoBridge
@@ -284,14 +288,15 @@ def initialize_model_from_hf(model_path, tp_size, pp_size):
             wrap_with_ddp=False,
         )
 
-    with record_timing("init.load_hf_weights", nvtx_color="blue"):
-        # Load HF weights into the Megatron model
-        bridge.load_weights(model_chunks, model_path)
-
+    # Skip HF weight loading for profiling - random init is sufficient
+    # bridge.load_weights() may fail due to version mismatch between
+    # the local repo's Megatron code and the installed mbridge package.
+    # For dist save/load profiling, actual weight values are irrelevant.
     logger.info(
-        "Initialized Megatron model from %s: tp=%d pp=%d, chunks=%d",
+        "Initialized Megatron model from %s (random weights): tp=%d pp=%d, chunks=%d",
         model_path, tp_size, pp_size, len(model_chunks),
     )
+    logger.info("Skipping bridge.load_weights() to avoid mbridge version compatibility issues")
 
     return model_chunks, bridge
 
