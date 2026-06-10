@@ -60,7 +60,6 @@ The script measures timing for these sub-operations (matching verl's stream trai
 | `init.parallel_state` | blue | Initialize Megatron parallel state |
 | `init.bridge_from_hf` | blue | Create mbridge from HF config |
 | `init.build_megatron_model` | blue | Build Megatron model via mbridge |
-| `init.load_hf_weights` | blue | Load HF weights into model |
 | `build_sharded_state_dict.model` | yellow | Build model sharded state dict |
 | `build_sharded_state_dict.optimizer` | yellow | Build optimizer sharded state dict |
 | `save.get_strategy` | red | Get/create save strategy |
@@ -69,19 +68,41 @@ The script measures timing for these sub-operations (matching verl's stream trai
 | `load.checkpoint_read` | green | dist_checkpointing.load() call |
 | `load.apply_state` | green | Apply loaded state to model |
 
-## Output
+## Profiling Results (Qwen3-0.6B, 2 GPUs, TP=1 PP=1 DP=2, model-only)
 
-After running, the script prints a summary table like:
+First successful run with 2 iterations, skipping optimizer state:
 
 ```
 ======================================================================
   DIST CHECKPOINT PROFILING SUMMARY (MAX ACROSS RANKS)
 ======================================================================
-  Operation                                          Max Mean (s)   Max Std (s)  Count
+  Operation                                          Max Mean (s)  Max Std (s)  Count
 ----------------------------------------------------------------------
-  build_sharded_state_dict.model                          0.0123        0.0012      3
-  save.checkpoint_write                                   1.4567        0.1234      3
-  load.checkpoint_read                                    0.8901        0.0567      3
-  load.apply_state                                        0.0045        0.0003      3
+  build_sharded_state_dict.model                           0.0063       0.0005      4
+  init.bridge_from_hf                                      0.0023       0.0000      1
+  init.build_megatron_model                                0.3935       0.0000      1
+  init.parallel_state                                      0.1344       0.0000      1
+  load.apply_state                                         0.0052       0.0000      2
+  load.checkpoint_read                                     0.9609       0.0463      2
+  load.get_strategy                                        0.0003       0.0000      2
+  save.checkpoint_write                                    5.3845       3.9801      2
+  save.get_strategy                                        0.0038       0.0035      2
 ======================================================================
 ```
+
+Key observations:
+- **Save dominates**: `save.checkpoint_write` takes ~5.4s (first iter ~9.4s, second iter ~1.4s)
+  - First iteration is slower due to strategy computation and disk I/O
+  - Second iteration benefits from strategy caching
+- **Load is faster**: `load.checkpoint_read` takes ~1.0s consistently
+- **State dict construction is fast**: `build_sharded_state_dict.model` ~6ms
+- **Strategy lookup is cheap**: `save.get_strategy` ~4ms, `load.get_strategy` ~0.3ms
+- **Apply state is fast**: `load.apply_state` ~5ms
+
+## Notes
+
+- The model uses **random weights** (not loaded from HF checkpoint) since we're profiling
+  the dist save/load APIs only. Weight values are irrelevant for this measurement.
+- The profiling runs on the local repo's Megatron code (shadowing the pip-installed megatron-core),
+  with compatibility patches for `ModelType.encoder_and_decoder` and `TENorm`.
+- NCCL is configured for RTX 4090 (no NVLink/P2P): `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_IB_DISABLE=1`
