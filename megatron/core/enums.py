@@ -7,6 +7,7 @@ class ModelType(enum.Enum):
     """Model type."""
 
     encoder_or_decoder = 1
+    encoder_and_decoder = 2
 
 
 class Fp8Recipe(str, enum.Enum):
