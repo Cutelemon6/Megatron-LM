@@ -2,7 +2,9 @@
 
 """Tests for PyTorch DCP based checkpoint format. """
 
+import os
 import pickle
+from types import SimpleNamespace
 from copy import deepcopy
 from dataclasses import fields
 
@@ -10,9 +12,25 @@ import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+from megatron.training.checkpointing import _dist_ckpt_load_workers
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+
+class TestDistCkptWorkerConfig:
+    def test_load_workers_falls_back_to_save_workers(self):
+        args = SimpleNamespace(dist_ckpt_workers=32, dist_ckpt_load_workers=None)
+
+        assert _dist_ckpt_load_workers(args) == 32
+
+    def test_load_workers_can_override_save_workers(self):
+        args = SimpleNamespace(dist_ckpt_workers=32, dist_ckpt_load_workers=16)
+
+        assert _dist_ckpt_load_workers(args) == 16
 
 
 class TestCachedMetadata:
@@ -88,6 +106,45 @@ class TestCachedMetadata:
                     len(x) for x in diffs
                 ), f'{field.name} is different in metadata from non-cached, cached metadata impls'
         ckpt_dir.cleanup()
+        Utils.destroy_model_parallel()
+
+    def test_threaded_load(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel()
+
+        def make_sharded_state_dict():
+            return {
+                'sd_keyA': ShardedTensor.from_rank_offsets(
+                    'keyA', torch.ones(2, 4), replica_id=Utils.rank
+                ),
+                'sd_keyB': ShardedTensor.from_rank_offsets(
+                    'keyB', torch.ones(3, 5, 7), replica_id=Utils.world_size - Utils.rank - 1
+                ),
+            }
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'threaded_load_ckpt_dir') as ckpt_dir:
+            save(make_sharded_state_dict(), ckpt_dir, async_sharded_save=False)
+
+            loaded_regular = load(make_sharded_state_dict(), ckpt_dir)
+            loaded_threaded = load(
+                make_sharded_state_dict(),
+                ckpt_dir,
+                TorchDistLoadShardedStrategy(cache_metadata=True, thread_count=2),
+            )
+
+            os.environ["MEGATRON_DIST_CKPT_READER_PROFILE"] = "1"
+            try:
+                loaded_profiled = load(
+                    make_sharded_state_dict(),
+                    ckpt_dir,
+                    TorchDistLoadShardedStrategy(cache_metadata=True, thread_count=2),
+                )
+            finally:
+                os.environ.pop("MEGATRON_DIST_CKPT_READER_PROFILE", None)
+
+        diffs = diff(loaded_regular, loaded_threaded)
+        assert not any(len(x) for x in diffs), 'Threaded load changed loaded state_dict values'
+        diffs = diff(loaded_regular, loaded_profiled)
+        assert not any(len(x) for x in diffs), 'Profiled threaded load changed loaded state_dict values'
         Utils.destroy_model_parallel()
 
 

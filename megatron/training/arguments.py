@@ -2687,6 +2687,9 @@ def _add_checkpointing_args(parser):
                        help='Number of workers for distributed checkpointing. '
                        'Only used for async save. '
                        'If set to 1, the checkpointing is performed in a single process.')
+    group.add_argument('--dist-ckpt-load-workers', type=int, default=None,
+                       help='Number of workers for distributed checkpoint loading. '
+                       'If unset, falls back to --dist-ckpt-workers.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')

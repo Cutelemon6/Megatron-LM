@@ -5,17 +5,21 @@ import inspect
 import io
 import os
 import pickle
+import threading
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import product
 from logging import getLogger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union, cast
+from time import perf_counter
 
 import torch
 from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
+from torch.distributed._shard._utils import narrow_tensor_by_index
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard
 from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
@@ -36,7 +40,9 @@ from torch.distributed.checkpoint import (
 from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten_state_dict
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.metadata import Metadata
+from torch.distributed.checkpoint.planner import LoadItemType
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
+from torch.futures import Future
 
 from ..core import CheckpointingException
 from ..dict_utils import nested_values
@@ -827,8 +833,12 @@ class TorchDistSaveShardedStrategy:
 
 
 def _get_filesystem_reader(
-    checkpoint_dir: Union[str, Path], cache_metadata: bool = False, async_strategy: str = "mcore"
+    checkpoint_dir: Union[str, Path],
+    cache_metadata: bool = False,
+    async_strategy: str = "mcore",
+    thread_count: int = 1,
 ) -> FileSystemReader:
+    thread_count = max(1, int(thread_count))
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
         if cache_metadata:
@@ -839,21 +849,240 @@ def _get_filesystem_reader(
                 "will be re-read on every load. Pass --enable-msc only when this is intended.",
                 stacklevel=2,
             )
-        return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
+        return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=thread_count)
 
     if cache_metadata:
+        if thread_count > 1:
+            return ThreadedCachedMetadataFileSystemReader(
+                checkpoint_dir, cache_metadata=cache_metadata, thread_count=thread_count
+            )
         _, module = get_async_strategy(async_strategy, module="CachedMetadataFileSystemReader")
         return module(checkpoint_dir, cache_metadata=cache_metadata)
 
+    if thread_count > 1:
+        return ThreadedFileSystemReader(checkpoint_dir, thread_count=thread_count)
+
     return FileSystemReader(checkpoint_dir)
+
+
+class ThreadedFileSystemReader(FileSystemReader):
+    """FileSystemReader variant that reads independent checkpoint files concurrently."""
+
+    def __init__(self, path: Union[str, os.PathLike], thread_count: int = 1) -> None:
+        super().__init__(path=path)
+        self.thread_count = max(1, int(thread_count))
+
+    def read_data(self, plan: LoadPlan, planner: MCoreLoadPlanner) -> Future:
+        if self.thread_count <= 1 or len(plan.items) <= 1:
+            return super().read_data(plan, planner)
+
+        per_file: Dict[str, List[ReadItem]] = {}
+        for read_item in plan.items:
+            item_md = self.storage_data[read_item.storage_index]
+            per_file.setdefault(item_md.relative_path, []).append(read_item)
+
+        if len(per_file) <= 1:
+            return super().read_data(plan, planner)
+
+        profile_reader = os.environ.get("MEGATRON_DIST_CKPT_READER_PROFILE", "") == "1"
+        planner_lock = threading.Lock()
+
+        if profile_reader:
+            profile_lock = threading.Lock()
+            profile_files = []
+
+            def read_file(relative_path: str, reqs: List[ReadItem]) -> None:
+                file_start = perf_counter()
+                local_profile = defaultdict(float)
+                local_profile["items"] = len(reqs)
+                new_path = self.fs.concat_path(self.path, relative_path)
+                with self.fs.create_stream(new_path, "rb") as stream:
+                    for req in reqs:
+                        item_md = self.storage_data[req.storage_index]
+                        local_profile["bytes"] += getattr(item_md, "length", 0) or 0
+                        slice_start = perf_counter()
+                        file_slice = self._slice_file(stream, item_md)
+                        local_profile["slice"] += perf_counter() - slice_start
+                        if req.type == LoadItemType.BYTE_IO:
+                            read_start = perf_counter()
+                            read_bytes = io.BytesIO(file_slice.read(item_md.length))
+                            read_bytes.seek(0)
+                            local_profile["byte_read"] += perf_counter() - read_start
+                            lock_wait_start = perf_counter()
+                            with planner_lock:
+                                local_profile["lock_wait"] += perf_counter() - lock_wait_start
+                                planner_start = perf_counter()
+                                planner.load_bytes(req, read_bytes)
+                                local_profile["planner"] += perf_counter() - planner_start
+                        else:
+                            load_start = perf_counter()
+                            tensor = cast(
+                                torch.Tensor,
+                                torch.load(
+                                    cast(io.BufferedIOBase, file_slice),
+                                    map_location="cpu",
+                                    weights_only=True,
+                                ),
+                            )
+                            local_profile["torch_load"] += perf_counter() - load_start
+                            narrow_start = perf_counter()
+                            tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
+                            local_profile["narrow"] += perf_counter() - narrow_start
+                            lock_wait_start = perf_counter()
+                            with planner_lock:
+                                local_profile["lock_wait"] += perf_counter() - lock_wait_start
+                                planner_start = perf_counter()
+                                target_tensor = planner.resolve_tensor(req).detach()
+                                resolve_done = perf_counter()
+                                assert target_tensor.size() == tensor.size(), (
+                                    f"req {req.storage_index} mismatch sizes "
+                                    f"{target_tensor.size()} vs {tensor.size()}"
+                                )
+                                if target_tensor.is_cuda:
+                                    with torch.cuda.device(target_tensor.device):
+                                        target_tensor.copy_(tensor)
+                                else:
+                                    target_tensor.copy_(tensor)
+                                copy_done = perf_counter()
+                                planner.commit_tensor(req, target_tensor)
+                                commit_done = perf_counter()
+                                local_profile["resolve"] += resolve_done - planner_start
+                                local_profile["copy"] += copy_done - resolve_done
+                                local_profile["copy_commit"] += commit_done - planner_start
+                                local_profile["commit"] += commit_done - copy_done
+
+                local_profile["total"] = perf_counter() - file_start
+                with profile_lock:
+                    profile_files.append((relative_path, dict(local_profile)))
+
+        else:
+
+            def read_file(relative_path: str, reqs: List[ReadItem]) -> None:
+                new_path = self.fs.concat_path(self.path, relative_path)
+                with self.fs.create_stream(new_path, "rb") as stream:
+                    for req in reqs:
+                        item_md = self.storage_data[req.storage_index]
+                        file_slice = self._slice_file(stream, item_md)
+                        if req.type == LoadItemType.BYTE_IO:
+                            read_bytes = io.BytesIO(file_slice.read(item_md.length))
+                            read_bytes.seek(0)
+                            with planner_lock:
+                                planner.load_bytes(req, read_bytes)
+                        else:
+                            tensor = cast(
+                                torch.Tensor,
+                                torch.load(
+                                    cast(io.BufferedIOBase, file_slice),
+                                    map_location="cpu",
+                                    weights_only=True,
+                                ),
+                            )
+                            tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
+                            with planner_lock:
+                                target_tensor = planner.resolve_tensor(req).detach()
+                                assert target_tensor.size() == tensor.size(), (
+                                    f"req {req.storage_index} mismatch sizes "
+                                    f"{target_tensor.size()} vs {tensor.size()}"
+                                )
+                                if target_tensor.is_cuda:
+                                    with torch.cuda.device(target_tensor.device):
+                                        target_tensor.copy_(tensor)
+                                else:
+                                    target_tensor.copy_(tensor)
+                                planner.commit_tensor(req, target_tensor)
+
+        total_start = perf_counter() if profile_reader else None
+        max_workers = min(self.thread_count, len(per_file))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(read_file, path, reqs) for path, reqs in per_file.items()]
+            for future in as_completed(futures):
+                future.result()
+
+        if profile_reader:
+            assert total_start is not None
+            total_elapsed = perf_counter() - total_start
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            totals = defaultdict(float)
+            for _, file_profile in profile_files:
+                for key, value in file_profile.items():
+                    totals[key] += value
+            slowest = sorted(profile_files, key=lambda item: item[1].get("total", 0.0), reverse=True)[:5]
+            slowest_desc = "; ".join(
+                f"{path}:total={stats.get('total', 0.0):.4f},items={int(stats.get('items', 0))},"
+                f"mb={stats.get('bytes', 0.0) / (1024 * 1024):.1f},"
+                f"load={stats.get('torch_load', 0.0):.4f},planner={stats.get('copy_commit', 0.0):.4f}"
+                for path, stats in slowest
+            )
+            logger.warning(
+                "dist_ckpt_reader_profile rank=%s files=%d workers=%d total=%.4f "
+                "items=%d mb=%.1f slice=%.4f byte_read=%.4f torch_load=%.4f "
+                "narrow=%.4f lock_wait=%.4f planner=%.4f resolve=%.4f copy=%.4f "
+                "copy_commit=%.4f commit=%.4f slowest=[%s]",
+                rank, len(profile_files), max_workers, total_elapsed,
+                int(totals.get("items", 0)), totals.get("bytes", 0.0) / (1024 * 1024),
+                totals.get("slice", 0.0), totals.get("byte_read", 0.0),
+                totals.get("torch_load", 0.0), totals.get("narrow", 0.0),
+                totals.get("lock_wait", 0.0), totals.get("planner", 0.0),
+                totals.get("resolve", 0.0), totals.get("copy", 0.0),
+                totals.get("copy_commit", 0.0), totals.get("commit", 0.0), slowest_desc,
+            )
+
+        fut: Future = Future()
+        fut.set_result(None)
+        return fut
+
+
+class ThreadedCachedMetadataFileSystemReader(ThreadedFileSystemReader):
+    """Threaded reader with process-local metadata caching by checkpoint path."""
+
+    _metadata_cache: Dict[str, Metadata] = {}
+
+    def __init__(
+        self,
+        path: Union[str, os.PathLike],
+        cache_metadata: bool = True,
+        thread_count: int = 1,
+    ) -> None:
+        super().__init__(path=path, thread_count=thread_count)
+        self._cache_key = os.path.abspath(os.fspath(path)) if cache_metadata else None
+
+    def read_metadata(self) -> Metadata:
+        if self._cache_key is None:
+            return super().read_metadata()
+        if self._cache_key not in ThreadedCachedMetadataFileSystemReader._metadata_cache:
+            ThreadedCachedMetadataFileSystemReader._metadata_cache[self._cache_key] = (
+                super().read_metadata()
+            )
+        return ThreadedCachedMetadataFileSystemReader._metadata_cache[self._cache_key]
+
+    @classmethod
+    def clear_metadata_cache(cls):
+        cls._metadata_cache.clear()
+
+
+def _load_checkpoint(
+    pyt_state_dict: Dict[str, Union[TorchShardedTensor, List[io.BytesIO]]],
+    fsr: FileSystemReader,
+    planner: MCoreLoadPlanner,
+) -> None:
+    load_params = inspect.signature(checkpoint.load).parameters
+    if "storage_reader" in load_params:
+        checkpoint.load(pyt_state_dict, storage_reader=fsr, planner=planner)
+        return
+
+    kwargs = {"planner": planner}
+    if "no_dist" in load_params:
+        kwargs["no_dist"] = True
+    checkpoint.load(pyt_state_dict, fsr, **kwargs)
 
 
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False):
+    def __init__(self, cache_metadata: bool = False, thread_count: int = 1):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
+        self.thread_count = max(1, int(thread_count))
 
     def load(
         self,
@@ -870,16 +1099,18 @@ class TorchDistLoadShardedStrategy:
 
         Returns: loaded state dict
         """
+        sharded_values = list(nested_values(sharded_state_dict))
         flexible_shape_sharded_tensors = [
             sh_ten
-            for sh_ten in nested_values(sharded_state_dict)
+            for sh_ten in sharded_values
             if isinstance(sh_ten, ShardedTensor) and not sh_ten.allow_shape_mismatch
         ]
         allow_shape_mismatch_sharded_tensors = {
             sh_ten.key: sh_ten
-            for sh_ten in nested_values(sharded_state_dict)
+            for sh_ten in sharded_values
             if isinstance(sh_ten, ShardedTensor) and sh_ten.allow_shape_mismatch
         }
+        has_sharded_tensors = any(isinstance(sh_ten, ShardedTensor) for sh_ten in sharded_values)
 
         orig_sharded_state_dict = sharded_state_dict
         # MCore state dict to PyT Distributed compatible
@@ -889,18 +1120,20 @@ class TorchDistLoadShardedStrategy:
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
         fsr = _get_filesystem_reader(
-            checkpoint_dir, cache_metadata=self.cache_metadata, async_strategy=async_strategy
+            checkpoint_dir,
+            cache_metadata=self.cache_metadata,
+            async_strategy=async_strategy,
+            thread_count=self.thread_count if has_sharded_tensors else 1,
         )
-        checkpoint.load(
+        _load_checkpoint(
             pyt_state_dict,
             fsr,
-            planner=MCoreLoadPlanner(
+            MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
                 flatten_state_dict=False,
                 flatten_sharded_tensors=False,
             ),
-            no_dist=True,
         )
 
         if self.cache_metadata:

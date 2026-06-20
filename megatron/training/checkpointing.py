@@ -134,6 +134,13 @@ def get_loaded_iteration():
     return _LOADED_ITERATION
 
 
+def _dist_ckpt_load_workers(args):
+    load_workers = getattr(args, 'dist_ckpt_load_workers', None)
+    if load_workers is None:
+        return args.dist_ckpt_workers
+    return load_workers
+
+
 def check_checkpoint_args(checkpoint_args):
     """Ensure fixed arguments for a model are the same for the input
     arguments and the one retrieved from checkpoint."""
@@ -1235,7 +1242,10 @@ def _load_global_dist_base_checkpoint(
         )
 
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
-    load_strategy = TorchDistLoadShardedStrategy(cache_metadata=args.ckpt_assume_constant_structure)
+    load_strategy = TorchDistLoadShardedStrategy(
+        cache_metadata=args.ckpt_assume_constant_structure,
+        thread_count=_dist_ckpt_load_workers(args),
+    )
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':
