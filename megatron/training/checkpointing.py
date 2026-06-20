@@ -141,6 +141,14 @@ def _dist_ckpt_load_workers(args):
     return load_workers
 
 
+def _dist_ckpt_sync_method(args):
+    if getattr(args, 'dist_ckpt_disable_fsync', False):
+        return 'none'
+    if getattr(args, 'dist_ckpt_use_fdatasync', False):
+        return 'fdatasync'
+    return 'fsync'
+
+
 def check_checkpoint_args(checkpoint_args):
     """Ensure fixed arguments for a model are the same for the input
     arguments and the one retrieved from checkpoint."""
@@ -650,7 +658,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             else:
                 validate_sharding_integrity = True
                 save_strategy = TorchDistSaveShardedStrategy(
-                    cpu_shm_mode=getattr(args, 'async_ckpt_use_cpu_shm', False)
+                    cpu_shm_mode=getattr(args, 'async_ckpt_use_cpu_shm', False),
+                    sync_method=_dist_ckpt_sync_method(args),
                 )
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
@@ -719,6 +728,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                             "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
                             "to use --async-ckpt-use-cpu-shm."
                         )
+                if "sync_method" in inspect.signature(FileSystemWriterAsync.__init__).parameters:
+                    _writer_kwargs["sync_method"] = _dist_ckpt_sync_method(args)
                 fs_storage_writer = FileSystemWriterAsync(
                     checkpoint_name,
                     thread_count=args.dist_ckpt_workers,

@@ -2690,6 +2690,13 @@ def _add_checkpointing_args(parser):
     group.add_argument('--dist-ckpt-load-workers', type=int, default=None,
                        help='Number of workers for distributed checkpoint loading. '
                        'If unset, falls back to --dist-ckpt-workers.')
+    group.add_argument('--dist-ckpt-use-fdatasync', action='store_true',
+                       help='Use fdatasync instead of fsync for each distributed checkpoint file. '
+                       'Only affects async distributed checkpoint writers that support it.')
+    group.add_argument('--dist-ckpt-disable-fsync', action='store_true',
+                       help='Skip per-file fsync/fdatasync in async distributed checkpoint writers. '
+                       'This can improve profiling throughput but weakens checkpoint durability; '
+                       'use only for experiments or when durability is handled externally.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')

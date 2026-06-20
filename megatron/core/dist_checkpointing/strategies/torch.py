@@ -607,6 +607,7 @@ class TorchDistSaveShardedStrategy:
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
         cpu_shm_mode: bool = False,
+        sync_method: str = "fsync",
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -625,6 +626,8 @@ class TorchDistSaveShardedStrategy:
                 training process before handing off to the async worker. Avoids CUDA IPC /
                 NVLink fabric handles in the worker subprocess. Only applies with nvrx async
                 strategy.
+            sync_method (str, optional): Per-file sync method for MCore async writer.
+                One of "fsync", "fdatasync", or "none". Default is "fsync".
         """
         self.backend = backend
         self.version = version
@@ -652,6 +655,7 @@ class TorchDistSaveShardedStrategy:
 
         self.separation_hint = separation_hint
         self.cpu_shm_mode = cpu_shm_mode
+        self.sync_method = sync_method
 
         self.validated_loaded_metadata_reuse = False
 
@@ -728,6 +732,8 @@ class TorchDistSaveShardedStrategy:
                     )
             state_dict_saver_kwargs["enable_cache"] = self.use_cached_ckpt_structure
             state_dict_saver_kwargs["metadata_cache"] = self._metadata_cache
+            if "sync_method" in inspect.signature(async_writer.__init__).parameters:
+                async_writer_kwargs["sync_method"] = self.sync_method
         else:
             # MCore's async implementation
             args_cached_plans = None
@@ -745,6 +751,8 @@ class TorchDistSaveShardedStrategy:
                 )
                 state_dict_saver_kwargs["cached_ckpt_structure"] = args_cached_plans
                 state_dict_saver_kwargs["loaded_all_plans"] = loaded_all_plans
+            if "sync_method" in inspect.signature(async_writer.__init__).parameters:
+                async_writer_kwargs["sync_method"] = self.sync_method
 
         # Use PyT saving mechanism
         writer = async_writer(

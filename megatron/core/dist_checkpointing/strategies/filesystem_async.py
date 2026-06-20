@@ -93,6 +93,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         *args,
         separation_hint: Optional[str] = None,
         use_msc: bool = False,
+        sync_method: str = "fsync",
         **kwargs,
     ):
         self.checkpoint_dir = path
@@ -109,6 +110,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Intermediate state between preparation and finalization
         self.write_buckets: Optional[List[WriteBucket]] = None
         self.results_queue: Optional[mp.Queue] = None
+        if sync_method not in ("fsync", "fdatasync", "none"):
+            raise ValueError(f"Unsupported checkpoint file sync method: {sync_method}")
+        self.sync_method = sync_method
         self.separation_hint = separation_hint
 
     def prepare_write_data(self, plan: SavePlan, planner: SavePlanner) -> None:
@@ -218,7 +222,12 @@ class FileSystemWriterAsync(FileSystemWriter):
             return None, None, []
         transform_list = [self.transforms] if hasattr(self, "transforms") else []
         return (
-            partial(self.write_preloaded_data_multithread, transform_list, self.use_msc),
+            partial(
+                self.write_preloaded_data_multithread,
+                transform_list,
+                self.use_msc,
+                self.sync_method,
+            ),
             partial(self.preload_tensors, self.write_buckets, True),
             [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
         )
@@ -253,6 +262,7 @@ class FileSystemWriterAsync(FileSystemWriter):
     def write_preloaded_data_multithread(
         transform_list: List[_StorageWriterTransforms],
         use_msc: bool,
+        sync_method: str,
         rank: int,
         write_buckets: List[WriteBucket],
         global_results_queue: mp.Queue,
@@ -276,6 +286,12 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         logger = logging.getLogger(__name__)
         w_start = time()
+        if os.environ.get("MEGATRON_DIST_CKPT_DISABLE_FSYNC", "") == "1":
+            sync_method = "none"
+        elif os.environ.get("MEGATRON_DIST_CKPT_USE_FDATASYNC", "") == "1":
+            sync_method = "fdatasync"
+        use_fsync = sync_method != "none"
+        use_fdatasync = sync_method == "fdatasync"
         write_results_or_exc: Union[dict, Exception] = dict()
         local_results_queue: queue.Queue = queue.Queue()
         count_queue: queue.Queue = queue.Queue()
@@ -297,7 +313,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                     "write_bucket": write_bucket,
                     "results_queue": local_results_queue,
                     "count_queue": count_queue,
-                    "use_fsync": True,
+                    "use_fsync": use_fsync,
+                    "use_fdatasync": use_fdatasync,
                 }
 
                 if use_msc:
@@ -386,6 +403,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         logger.debug(f"{local_proc_idx} started")
         mem_before = _process_memory()
         use_msc = kwargs.get("use_msc", False)
+        use_fdatasync = kwargs.get("use_fdatasync", False)
 
         local_results = []
         try:
@@ -420,6 +438,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                 if use_fsync:
                     if use_msc:
                         stream.fsync()
+                    elif use_fdatasync and hasattr(os, "fdatasync"):
+                        os.fdatasync(stream.fileno())
                     else:
                         os.fsync(stream.fileno())
             local_output = (local_proc_idx, local_results)
