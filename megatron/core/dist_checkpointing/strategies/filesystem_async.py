@@ -228,12 +228,49 @@ class FileSystemWriterAsync(FileSystemWriter):
                 self.use_msc,
                 self.sync_method,
             ),
-            partial(self.preload_tensors, self.write_buckets, True),
+            partial(self.preload_tensors, self.write_buckets, True, torch.distributed.get_rank()),
             [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
         )
 
     @staticmethod
-    def preload_tensors(write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
+    def _copy_tensor_to_cpu(
+        tensor: torch.Tensor,
+        non_blocking: bool = True,
+        use_pinned_d2h: bool = False,
+        profile_stats: Optional[Dict[str, float]] = None,
+    ) -> torch.Tensor:
+        def _add_profile_stat(key: str, value: float) -> None:
+            if profile_stats is not None:
+                profile_stats[key] = profile_stats.get(key, 0.0) + value
+
+        if (
+            use_pinned_d2h
+            and tensor.device.type == "cuda"
+            and tensor.layout == torch.strided
+        ):
+            alloc_start = time()
+            cpu_tensor = torch.empty_like(
+                tensor,
+                device="cpu",
+                pin_memory=True,
+                memory_format=torch.preserve_format,
+            )
+            _add_profile_stat("pinned_alloc_elapsed", time() - alloc_start)
+            copy_start = time()
+            cpu_tensor.copy_(tensor, non_blocking=non_blocking)
+            _add_profile_stat("pinned_copy_enqueue_elapsed", time() - copy_start)
+            _add_profile_stat("pinned_copy_items", 1.0)
+            return cpu_tensor
+        copy_start = time()
+        cpu_tensor = tensor.to("cpu", non_blocking=non_blocking)
+        _add_profile_stat("fallback_copy_elapsed", time() - copy_start)
+        _add_profile_stat("fallback_copy_items", 1.0)
+        return cpu_tensor
+
+    @staticmethod
+    def preload_tensors(
+        write_buckets: List[WriteBucket], non_blocking=True, rank: int = -1
+    ) -> List[WriteBucket]:
         """
         Preloads tensors in `state_dict` to host memory via CPU memory.
 
@@ -241,20 +278,87 @@ class FileSystemWriterAsync(FileSystemWriter):
             write_buckets (List): List of `WriteBucket` objects that define what to
                 save in a checkpoint.
             non_blocking (bool, optional): knob to enable pinned D2H memcpy. Default is True.
+            rank (int, optional): rank used only for profile logging.
         """
+        profile_preload = os.environ.get("MEGATRON_DIST_CKPT_WRITER_PROFILE", "") == "1"
+        use_pinned_d2h = os.environ.get("MEGATRON_DIST_CKPT_PINNED_D2H", "") == "1"
+        rss_before = _process_memory() if profile_preload else 0
+        preload_start = time()
+        copy_start = preload_start
+        logical_bytes = 0
+        tensor_count = 0
+        cuda_tensor_count = 0
+        pinned_tensor_count = 0
+        copy_profile_stats: Dict[str, float] = {}
         result = []
 
         for bucket in write_buckets:
             file_name, storage_key, (bytes_data, tensor_data) = bucket
             tensor_list = []
+            if profile_preload:
+                for _, data in bytes_data:
+                    logical_bytes += len(data.getbuffer())
             for item, tensor in tensor_data:
+                use_pinned_for_tensor = (
+                    use_pinned_d2h
+                    and tensor.device.type == "cuda"
+                    and tensor.layout == torch.strided
+                )
+                if profile_preload:
+                    tensor_count += 1
+                    logical_bytes += tensor.numel() * tensor.element_size()
+                    if tensor.device.type == "cuda":
+                        cuda_tensor_count += 1
+                    if use_pinned_for_tensor:
+                        pinned_tensor_count += 1
                 # we belive these tensors are detached from the model trainers
-                tensor_list.append((item, tensor.to("cpu", non_blocking=non_blocking)))
+                tensor_list.append(
+                    (
+                        item,
+                        FileSystemWriterAsync._copy_tensor_to_cpu(
+                            tensor,
+                            non_blocking,
+                            use_pinned_d2h,
+                            copy_profile_stats if profile_preload else None,
+                        ),
+                    )
+                )
                 # This is required for `PersistentAsyncCaller` to remove reference
                 del tensor
             result.append((file_name, storage_key, (bytes_data, tensor_list)))
+        copy_elapsed = time() - copy_start
+        sync_elapsed = 0.0
         if non_blocking:
+            sync_start = time()
             torch.cuda.synchronize()
+            sync_elapsed = time() - sync_start
+        if profile_preload:
+            rss_after = _process_memory()
+            logger.warning(
+                "dist_ckpt_preload_detail_profile rank=%s buckets=%d total=%.4f "
+                "copy_schedule=%.4f cuda_sync=%.4f tensor_items=%d cuda_tensor_items=%d "
+                "logical_mb=%.1f non_blocking=%s pinned_d2h=%s pinned_tensor_items=%d "
+                "pinned_alloc=%.4f pinned_copy_enqueue=%.4f fallback_copy=%.4f "
+                "pinned_copy_items=%d fallback_copy_items=%d rss_before_mb=%.1f rss_after_mb=%.1f",
+                rank,
+                len(write_buckets),
+                time() - preload_start,
+                copy_elapsed,
+                sync_elapsed,
+                tensor_count,
+                cuda_tensor_count,
+                logical_bytes / (1024 * 1024),
+                non_blocking,
+                use_pinned_d2h,
+                pinned_tensor_count,
+                copy_profile_stats.get("pinned_alloc_elapsed", 0.0),
+                copy_profile_stats.get("pinned_copy_enqueue_elapsed", 0.0),
+                copy_profile_stats.get("fallback_copy_elapsed", 0.0),
+                int(copy_profile_stats.get("pinned_copy_items", 0.0)),
+                int(copy_profile_stats.get("fallback_copy_items", 0.0)),
+                rss_before / (1024 * 1024),
+                rss_after / (1024 * 1024),
+            )
         return result
 
     @staticmethod
@@ -286,6 +390,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         logger = logging.getLogger(__name__)
         w_start = time()
+        profile_writer = os.environ.get("MEGATRON_DIST_CKPT_WRITER_PROFILE", "") == "1"
         if os.environ.get("MEGATRON_DIST_CKPT_DISABLE_FSYNC", "") == "1":
             sync_method = "none"
         elif os.environ.get("MEGATRON_DIST_CKPT_USE_FDATASYNC", "") == "1":
@@ -296,6 +401,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         local_results_queue: queue.Queue = queue.Queue()
         count_queue: queue.Queue = queue.Queue()
         thread_list: List[threading.Thread] = []
+        main_worker_kwargs = None
 
         def check_local_output(local_results_or_exc, local_worker_idx):
             if isinstance(local_results_or_exc, Exception):
@@ -310,6 +416,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             try:
                 kwargs = {
                     "local_proc_idx": i,
+                    "rank": rank,
                     "write_bucket": write_bucket,
                     "results_queue": local_results_queue,
                     "count_queue": count_queue,
@@ -321,7 +428,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     signature = inspect.signature(FileSystemWriterAsync.write_preloaded_data)
                     if len(signature.parameters) > 6:
                         kwargs['use_msc'] = use_msc
-                # Parallel writers: spawn threads for all but the last bucket
+                # Prepare worker threads for all but the last bucket; start them together below.
                 if i < len(write_buckets) - 1:
                     count_queue.put(i)
                     t = threading.Thread(
@@ -332,9 +439,24 @@ class FileSystemWriterAsync(FileSystemWriter):
                 else:
                     kwargs['count_queue'] = None
                     kwargs['results_queue'] = None
+                    main_worker_kwargs = kwargs
+
+            except Exception as e:
+                err_msg = f"An error is caught while starting worker {i}, error: {e}"
+                logger.error(err_msg)
+                write_results_or_exc = RuntimeError(err_msg)
+
+        threads_started = False
+        if not isinstance(write_results_or_exc, Exception):
+            for t in thread_list:
+                t.start()
+            threads_started = len(thread_list) > 0
+
+            if main_worker_kwargs is not None:
+                try:
                     logger.debug('FileSystemWriterAsync: main worker started')
                     local_output = FileSystemWriterAsync.write_preloaded_data(
-                        transform_list, **kwargs
+                        transform_list, **main_worker_kwargs
                     )
                     if local_output is not None:
                         logger.debug(
@@ -342,38 +464,49 @@ class FileSystemWriterAsync(FileSystemWriter):
                         )
                         check_local_output(local_output[1], local_output[0])
                         write_results_or_exc[local_output[0]] = local_output[1]
+                except Exception as e:
+                    err_msg = f"An error is caught while running main worker, error: {e}"
+                    logger.error(err_msg)
+                    write_results_or_exc = RuntimeError(err_msg)
 
-            except Exception as e:
-                err_msg = f"An error is caught while starting worker {i}, error: {e}"
-                logger.error(err_msg)
-                write_results_or_exc = RuntimeError(err_msg)
-
-        if not isinstance(write_results_or_exc, Exception) and len(thread_list) > 0:
-            for t in thread_list:
-                t.start()
-
+        if threads_started:
             logger.debug("FileSystemWriterAsync: collecting worker results...")
 
             count_queue.join()
-            for _ in range(len(write_buckets) - 1):
+            worker_results_or_exc = None
+            for _ in range(len(thread_list)):
                 try:
-                    local_proc_idx, local_results_or_exc = local_results_queue.get()
+                    local_proc_idx, local_results_or_exc = local_results_queue.get_nowait()
                 except queue.Empty:
-                    write_results_or_exc = RuntimeError(
+                    worker_results_or_exc = RuntimeError(
                         "Unexpected empty `local_results_queue`"
-                        f" (expected {len(write_buckets) - 1} items)"
+                        f" (expected {len(thread_list)} items)"
                     )
                     break
                 else:
+                    if isinstance(write_results_or_exc, Exception):
+                        continue
                     check_local_output(local_results_or_exc, local_proc_idx)
                     write_results_or_exc[local_proc_idx] = local_results_or_exc
             for t in thread_list:
                 t.join()
+            if worker_results_or_exc is not None and not isinstance(write_results_or_exc, Exception):
+                write_results_or_exc = worker_results_or_exc
             logger.debug('FileSystemWriterAsync: collected worker results successfully')
 
         global_results_queue.put(write_results_or_exc)
 
         w_end = time()
+        if profile_writer:
+            logger.warning(
+                "dist_ckpt_writer_rank_profile rank=%s buckets=%d total=%.4f "
+                "use_fsync=%s use_fdatasync=%s",
+                rank,
+                len(write_buckets),
+                w_end - w_start,
+                use_fsync,
+                use_fdatasync,
+            )
         logger.debug(f"{w_end}, rank: {rank}, write(sync,threads): {w_end - w_start}")
 
     @staticmethod
@@ -404,10 +537,24 @@ class FileSystemWriterAsync(FileSystemWriter):
         mem_before = _process_memory()
         use_msc = kwargs.get("use_msc", False)
         use_fdatasync = kwargs.get("use_fdatasync", False)
+        rank = kwargs.get("rank", -1)
+        profile_writer = os.environ.get("MEGATRON_DIST_CKPT_WRITER_PROFILE", "") == "1"
+        profile_start = time()
+        write_elapsed = 0.0
+        fsync_elapsed = 0.0
 
         local_results = []
+        byte_item_count = 0
+        tensor_item_count = 0
+        logical_bytes = 0
         try:
             file_name, storage_key, (bytes_data, tensor_data) = write_bucket
+            byte_item_count = len(bytes_data)
+            tensor_item_count = len(tensor_data)
+            for _, data in bytes_data:
+                logical_bytes += len(data.getbuffer())
+            for _, tensor in tensor_data:
+                logical_bytes += tensor.numel() * tensor.element_size()
             extra_kwargs = {}
             if "serialization_format" in inspect.signature(_write_item).parameters:
                 from torch.distributed.checkpoint.filesystem import SerializationFormat
@@ -420,6 +567,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 open_file = open
             with open_file(file_name, "wb") as stream:
+                write_start = time()
                 for write_item, data in bytes_data:
                     local_results.append(
                         _write_item(
@@ -434,18 +582,26 @@ class FileSystemWriterAsync(FileSystemWriter):
                             *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
                         )
                     )
+                write_elapsed = time() - write_start
 
                 if use_fsync:
+                    fsync_start = time()
                     if use_msc:
                         stream.fsync()
                     elif use_fdatasync and hasattr(os, "fdatasync"):
                         os.fdatasync(stream.fileno())
                     else:
                         os.fsync(stream.fileno())
+                    fsync_elapsed = time() - fsync_start
             local_output = (local_proc_idx, local_results)
         except Exception as e:
             logger.debug(f"{local_proc_idx} failed")
             local_output = (local_proc_idx, e)  # type: ignore[assignment]
+        finally:
+            if 'bytes_data' in locals() and hasattr(bytes_data, 'clear'):
+                bytes_data.clear()
+            if 'tensor_data' in locals() and hasattr(tensor_data, 'clear'):
+                tensor_data.clear()
         if results_queue is not None:
             results_queue.put(local_output)
         if count_queue is not None:
@@ -454,6 +610,28 @@ class FileSystemWriterAsync(FileSystemWriter):
             count_queue.task_done()
 
         mem_after = _process_memory()
+        if profile_writer:
+            serialized_bytes = 0
+            if isinstance(local_results, list):
+                serialized_bytes = sum(
+                    getattr(result, "size_in_bytes", 0) for result in local_results
+                )
+            logger.warning(
+                "dist_ckpt_writer_bucket_profile rank=%s bucket=%s total=%.4f write=%.4f "
+                "fsync=%.4f byte_items=%d tensor_items=%d logical_mb=%.1f serialized_mb=%.1f "
+                "rss_before_mb=%.1f rss_after_mb=%.1f",
+                rank,
+                local_proc_idx,
+                time() - profile_start,
+                write_elapsed,
+                fsync_elapsed,
+                byte_item_count,
+                tensor_item_count,
+                logical_bytes / (1024 * 1024),
+                serialized_bytes / (1024 * 1024),
+                mem_before / (1024 * 1024),
+                mem_after / (1024 * 1024),
+            )
         logger.debug(
             f"{local_proc_idx} consumed: {mem_after - mem_before},"
             f" before: {mem_before}, after: {mem_after}"

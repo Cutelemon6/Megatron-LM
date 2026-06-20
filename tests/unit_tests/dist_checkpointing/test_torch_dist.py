@@ -2,16 +2,20 @@
 
 """Tests for PyTorch DCP based checkpoint format. """
 
+import io
 import os
 import pickle
 from types import SimpleNamespace
 from copy import deepcopy
 from dataclasses import fields
 
+import pytest
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
+import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async
 from megatron.core.dist_checkpointing.dict_utils import diff
+from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
 from megatron.training.checkpointing import _dist_ckpt_load_workers
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
@@ -31,6 +35,133 @@ class TestDistCkptWorkerConfig:
         args = SimpleNamespace(dist_ckpt_workers=32, dist_ckpt_load_workers=16)
 
         assert _dist_ckpt_load_workers(args) == 16
+
+
+class TestAsyncPreloadCopy:
+    def test_cpu_tensor_copy_ignores_pinned_d2h(self):
+        tensor = torch.arange(8, dtype=torch.float32)
+
+        copied = FileSystemWriterAsync._copy_tensor_to_cpu(
+            tensor, non_blocking=True, use_pinned_d2h=True
+        )
+
+        assert copied.device.type == 'cpu'
+        assert torch.equal(copied, tensor)
+
+    def test_cpu_tensor_copy_reports_fallback_copy_stats(self):
+        tensor = torch.arange(8, dtype=torch.float32)
+        profile_stats = {}
+
+        copied = FileSystemWriterAsync._copy_tensor_to_cpu(
+            tensor,
+            non_blocking=True,
+            use_pinned_d2h=True,
+            profile_stats=profile_stats,
+        )
+
+        assert copied.device.type == 'cpu'
+        assert profile_stats['fallback_copy_items'] == 1
+        assert profile_stats.get('pinned_copy_items', 0) == 0
+        assert profile_stats['fallback_copy_elapsed'] >= 0.0
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA is required')
+    def test_cuda_tensor_can_stage_to_pinned_cpu(self):
+        tensor = torch.arange(8, dtype=torch.float32, device='cuda')
+
+        copied = FileSystemWriterAsync._copy_tensor_to_cpu(
+            tensor, non_blocking=True, use_pinned_d2h=True
+        )
+        torch.cuda.synchronize()
+
+        assert copied.device.type == 'cpu'
+        assert copied.is_pinned()
+        assert torch.equal(copied, tensor.cpu())
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA is required')
+    def test_cuda_tensor_reports_pinned_copy_stats(self):
+        tensor = torch.arange(8, dtype=torch.float32, device='cuda')
+        profile_stats = {}
+
+        copied = FileSystemWriterAsync._copy_tensor_to_cpu(
+            tensor,
+            non_blocking=True,
+            use_pinned_d2h=True,
+            profile_stats=profile_stats,
+        )
+        torch.cuda.synchronize()
+
+        assert copied.device.type == 'cpu'
+        assert copied.is_pinned()
+        assert profile_stats['pinned_copy_items'] == 1
+        assert profile_stats.get('fallback_copy_items', 0) == 0
+        assert profile_stats['pinned_alloc_elapsed'] >= 0.0
+        assert profile_stats['pinned_copy_enqueue_elapsed'] >= 0.0
+
+    def test_preload_tensors_profiles_rss_before_and_after(self, monkeypatch, caplog):
+        bytes_data = []
+        tensor_data = [(object(), torch.arange(4, dtype=torch.float32))]
+        write_buckets = [('payload.distcp', 'storage_key', (bytes_data, tensor_data))]
+        memory_values = iter([200 * 1024 * 1024, 220 * 1024 * 1024])
+        monkeypatch.setattr(filesystem_async, '_process_memory', lambda: next(memory_values))
+        monkeypatch.setenv('MEGATRON_DIST_CKPT_WRITER_PROFILE', '1')
+
+        with caplog.at_level('WARNING', logger=filesystem_async.__name__):
+            result = FileSystemWriterAsync.preload_tensors(write_buckets, non_blocking=False, rank=7)
+
+        assert result[0][2][1][0][1].device.type == 'cpu'
+        assert 'rss_before_mb=200.0' in caplog.text
+        assert 'rss_after_mb=220.0' in caplog.text
+
+
+class TestAsyncWritePayloadRelease:
+    def test_write_preloaded_data_clears_payload_lists_after_write(self, tmp_path, monkeypatch):
+        bytes_data = [(object(), io.BytesIO(b'abc'))]
+        tensor_data = [(object(), torch.arange(4, dtype=torch.float32))]
+        write_bucket = (str(tmp_path / 'payload.distcp'), 'storage_key', (bytes_data, tensor_data))
+
+        def fake_write_item(stream, data, write_item, storage_key):
+            if isinstance(data, io.BytesIO):
+                stream.write(data.getvalue())
+                size_in_bytes = len(data.getvalue())
+            else:
+                stream.write(data.numpy().tobytes())
+                size_in_bytes = data.numel() * data.element_size()
+            return SimpleNamespace(size_in_bytes=size_in_bytes)
+
+        monkeypatch.setattr(filesystem_async, '_write_item', fake_write_item)
+
+        local_proc_idx, local_results = FileSystemWriterAsync.write_preloaded_data(
+            [], 0, write_bucket, results_queue=None, count_queue=None, use_fsync=False
+        )
+
+        assert local_proc_idx == 0
+        assert len(local_results) == 2
+        assert bytes_data == []
+        assert tensor_data == []
+
+    def test_write_preloaded_data_profiles_rss_before_and_after(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        bytes_data = []
+        tensor_data = [(object(), torch.arange(4, dtype=torch.float32))]
+        write_bucket = (str(tmp_path / 'payload.distcp'), 'storage_key', (bytes_data, tensor_data))
+
+        def fake_write_item(stream, data, write_item, storage_key):
+            stream.write(data.numpy().tobytes())
+            return SimpleNamespace(size_in_bytes=data.numel() * data.element_size())
+
+        memory_values = iter([100 * 1024 * 1024, 120 * 1024 * 1024])
+        monkeypatch.setattr(filesystem_async, '_write_item', fake_write_item)
+        monkeypatch.setattr(filesystem_async, '_process_memory', lambda: next(memory_values))
+        monkeypatch.setenv('MEGATRON_DIST_CKPT_WRITER_PROFILE', '1')
+
+        with caplog.at_level('WARNING', logger=filesystem_async.__name__):
+            FileSystemWriterAsync.write_preloaded_data(
+                [], 0, write_bucket, results_queue=None, count_queue=None, use_fsync=False
+            )
+
+        assert 'rss_before_mb=100.0' in caplog.text
+        assert 'rss_after_mb=120.0' in caplog.text
 
 
 class TestCachedMetadata:
