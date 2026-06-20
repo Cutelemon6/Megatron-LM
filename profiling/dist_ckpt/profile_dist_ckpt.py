@@ -360,23 +360,47 @@ def install_timing_patches():
     # TorchDistLoadShardedStrategy.load
     _orig_tds_load = torch_mod.TorchDistLoadShardedStrategy.load
     def _patched_tds_load(self, *args, **kwargs):
+        load_name = "load.torch_dist_load_unknown"
+        try:
+            from megatron.core.dist_checkpointing import ShardedObject, ShardedTensor
+            from megatron.core.dist_checkpointing.dict_utils import nested_values
+
+            sharded_state_dict = args[0] if args else kwargs.get("sharded_state_dict", {})
+            values = list(nested_values(sharded_state_dict))
+            has_tensors = any(isinstance(value, ShardedTensor) for value in values)
+            has_objects = any(isinstance(value, ShardedObject) for value in values)
+            if has_tensors and has_objects:
+                load_name = "load.torch_dist_load_mixed"
+            elif has_tensors:
+                load_name = "load.torch_dist_load_tensors"
+            elif has_objects:
+                load_name = "load.torch_dist_load_objects"
+            else:
+                load_name = "load.torch_dist_load_empty"
+        except Exception:
+            pass
         with record_timing("load.torch_dist_load", nvtx_color="green"):
-            return _orig_tds_load(self, *args, **kwargs)
+            with record_timing(load_name, nvtx_color="green"):
+                return _orig_tds_load(self, *args, **kwargs)
     torch_mod.TorchDistLoadShardedStrategy.load = _patched_tds_load
 
-    # exchange_by_distribution
+    # exchange_by_distribution. FullyParallelLoadStrategyWrapper imports this
+    # symbol directly, so patch both the source module and the local reference.
     from megatron.core.dist_checkpointing import exchange_utils as exchange_mod
-    _orig_exchange_by_dist = exchange_mod.exchange_by_distribution
+    _orig_exchange_by_dist = fp_mod.exchange_by_distribution
     def _patched_exchange_by_dist(*args, **kwargs):
         with record_timing("load.exchange_by_distribution", nvtx_color="green"):
             return _orig_exchange_by_dist(*args, **kwargs)
+    fp_mod.exchange_by_distribution = _patched_exchange_by_dist
     exchange_mod.exchange_by_distribution = _patched_exchange_by_dist
 
-    # exchange_loaded_objects_gather_object
-    _orig_exchange_obj = exchange_mod.exchange_loaded_objects_gather_object
+    # exchange_loaded_objects_gather_object. Patch the local fully_parallel
+    # reference as well, otherwise training load misses this timer.
+    _orig_exchange_obj = fp_mod.exchange_loaded_objects_gather_object
     def _patched_exchange_obj(*args, **kwargs):
         with record_timing("load.exchange_objects", nvtx_color="green"):
             return _orig_exchange_obj(*args, **kwargs)
+    fp_mod.exchange_loaded_objects_gather_object = _patched_exchange_obj
     exchange_mod.exchange_loaded_objects_gather_object = _patched_exchange_obj
 
     logger.info("Installed fine-grained timing patches for dist_checkpointing save/load")
