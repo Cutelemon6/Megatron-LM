@@ -88,10 +88,16 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
                 "Installed nvidia-resiliency-ext does not support cpu_shm_mode. "
                 "Update nvidia-resiliency-ext to use --async-ckpt-use-cpu-shm."
             )
+    warmup_params = inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters
+    qos_kwargs = {
+        "cpu_priority": args.async_ckpt_cpu_priority,
+        "io_priority": args.async_ckpt_io_priority,
+    }
+    if "io_priority_level" in warmup_params:
+        qos_kwargs["io_priority_level"] = getattr(args, "async_ckpt_io_priority_level", None)
     AsyncCallsQueue.warmup_persistent_caller(
         rank,
-        cpu_priority=args.async_ckpt_cpu_priority,
-        io_priority=args.async_ckpt_io_priority,
+        **qos_kwargs,
         **warmup_kwargs,
     )
     # initialize ckpt write results queue

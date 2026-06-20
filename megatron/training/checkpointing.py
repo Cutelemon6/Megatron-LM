@@ -629,9 +629,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             or ckpt_type != CheckpointType.LEGACY:
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
-            if args.use_distributed_optimizer:
+            if args.use_distributed_optimizer and not args.no_save_optim:
                 print_rank_0(f'Storing distributed optimizer sharded state of type'
                              f' {sharded_sd_metadata["distrib_optim_sharding_type"]}')
+            elif args.use_distributed_optimizer:
+                print_rank_0('Skipping distributed optimizer sharded state because --no-save-optim is set')
         else:
             sharded_sd_metadata = None
         state_dict = generate_state_dict(
@@ -848,7 +850,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                 delete_process = ctx.Process(
                                     target=_async_delete_checkpoint_impl,
                                     args=(args.save, prev_iteration, args.log_progress, True,
-                                          args.async_ckpt_cpu_priority, args.async_ckpt_io_priority),
+                                          args.async_ckpt_cpu_priority, args.async_ckpt_io_priority,
+                                          getattr(args, 'async_ckpt_io_priority_level', None)),
                                     daemon=True
                                 )
                                 delete_process.start()
@@ -902,7 +905,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
 @_disable_gc()
 def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=False, lower_priority=False,
-                                  cpu_priority=None, io_priority=None):
+                                  cpu_priority=None, io_priority=None, io_priority_level=None):
     """Module-level function for async checkpoint deletion.
     
     This function can be pickled and executed by the async worker process.
@@ -916,10 +919,15 @@ def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=F
         lower_priority (bool): If True, set process QoS (e.g. nice, ionice) so deletion doesn't contend with training.
         cpu_priority (int): Nice value for CPU when lower_priority is True (from args.async_ckpt_cpu_priority).
         io_priority (int): I/O class when lower_priority is True (from args.async_ckpt_io_priority).
+        io_priority_level (int): I/O priority level when lower_priority is True.
     """
     if lower_priority:
         from megatron.core.dist_checkpointing.strategies.async_utils import _set_process_qos
-        _set_process_qos(cpu_priority=cpu_priority, io_priority=io_priority)
+        _set_process_qos(
+            cpu_priority=cpu_priority,
+            io_priority=io_priority,
+            io_priority_level=io_priority_level,
+        )
 
     checkpoint_name = get_checkpoint_name(save_path, iteration=iteration_to_delete,
                                          return_base_dir=True)

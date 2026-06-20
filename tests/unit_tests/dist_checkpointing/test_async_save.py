@@ -8,7 +8,7 @@ from torch.distributed.checkpoint import CheckpointException
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
+from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest
 from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 from megatron.core.dist_checkpointing.strategies.torch import (
@@ -32,6 +32,25 @@ def write_data_os_err_mock_fn(
     results_queue.put(output)
     count_queue.get()
     count_queue.task_done()
+
+
+class TestAsyncCallsQueueProfiling:
+    def test_schedule_async_request_stamps_call_idx_and_schedule_time(self):
+        captured = []
+
+        class FakeAsyncCaller:
+            def schedule_async_call(self, async_request):
+                captured.append(async_request)
+
+        async_calls = AsyncCallsQueue(persistent=False)
+        async_calls._get_async_caller = lambda: FakeAsyncCaller()
+        async_request = AsyncRequest(async_fn=lambda: None, async_fn_args=(), finalize_fns=[])
+
+        call_idx = async_calls.schedule_async_request(async_request)
+
+        assert call_idx == 0
+        assert captured[0].call_idx == 0
+        assert captured[0].scheduled_at > 0.0
 
 
 class TestAsyncSave:

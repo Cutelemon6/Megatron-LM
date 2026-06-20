@@ -376,10 +376,10 @@ class CheckpointConfig:
     """Output directory to save checkpoints to."""
 
     save_interval: int | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}})
+    """Number of iterations between persistent checkpoint saves."""
+
     no_final_save: bool = False
     """Do not write an extra persistent checkpoint at the end of training."""
-
-    """Number of iterations between persistent checkpoint saves."""
 
     save_params_interval: int | None = None
     """Number of iterations between param.name->param.data mapping saves."""
@@ -514,6 +514,9 @@ class CheckpointConfig:
 
     async_ckpt_io_priority: Optional[int] = 3
     """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process."""
+
+    async_ckpt_io_priority_level: Optional[int] = None
+    """Optional I/O priority level (0-7, lower is higher priority) for classes that support it."""
 
     async_ckpt_use_cpu_shm: bool = False
     """Copy GPU tensors to CPU shared-memory in the training process before handing off to
