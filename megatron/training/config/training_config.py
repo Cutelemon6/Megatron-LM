@@ -376,6 +376,9 @@ class CheckpointConfig:
     """Output directory to save checkpoints to."""
 
     save_interval: int | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}})
+    no_final_save: bool = False
+    """Do not write an extra persistent checkpoint at the end of training."""
+
     """Number of iterations between persistent checkpoint saves."""
 
     save_params_interval: int | None = None

@@ -670,6 +670,7 @@ def _make_args(**overrides):
         "no_load_rng": False,
         # CheckpointConfig custom argparse dest names
         "ckpt_fully_parallel_save": True,
+        "no_final_save": False,
         "ckpt_fully_parallel_load": False,
         # ProfilingConfig: use_nsys_profiler is exposed as --profile on the CLI
         "profile": False,
@@ -807,6 +808,21 @@ class TestCheckpointConfigMapping:
         assert result.checkpoint.save == "/path/to/save"
         assert result.checkpoint.load == "/path/to/load"
         assert result.checkpoint.save_interval == 500
+
+    def test_no_final_save_maps_to_checkpoint_config(self, patch_training_helpers):
+        result = pretrain_cfg_container_from_args(_make_args(no_final_save=True))
+        assert result.checkpoint.no_final_save is True
+
+
+class TestCheckpointArgumentParser:
+    def test_no_final_save_is_registered_once(self):
+        from megatron.training.arguments import _add_checkpointing_args
+
+        parser = ArgumentParser()
+        _add_checkpointing_args(parser)
+
+        args = parser.parse_args(["--no-final-save"])
+        assert args.no_final_save is True
 
 
 class TestProfilingConfigMapping:

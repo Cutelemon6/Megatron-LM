@@ -9,7 +9,10 @@ import torch
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
-from megatron.training.training import build_train_valid_test_data_iterators
+from megatron.training.training import (
+    _should_save_checkpoint_at_train_end,
+    build_train_valid_test_data_iterators,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -119,6 +122,43 @@ class TestTraining:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+
+class TestFinalCheckpointSave:
+    def _cfg(self, *, skip_train=False, save="/tmp/ckpt", save_interval=2, no_final_save=False):
+        return SimpleNamespace(
+            validation=SimpleNamespace(skip_train=skip_train),
+            checkpoint=SimpleNamespace(
+                save=save,
+                save_interval=save_interval,
+                no_final_save=no_final_save,
+            ),
+        )
+
+    def test_saves_at_train_end_when_iteration_is_not_aligned(self):
+        cfg = self._cfg(save_interval=3)
+
+        assert _should_save_checkpoint_at_train_end(cfg, iteration=2)
+
+    def test_does_not_save_at_train_end_when_iteration_is_aligned(self):
+        cfg = self._cfg(save_interval=2)
+
+        assert not _should_save_checkpoint_at_train_end(cfg, iteration=2)
+
+    def test_does_not_save_at_train_end_when_disabled(self):
+        cfg = self._cfg(save_interval=3, no_final_save=True)
+
+        assert not _should_save_checkpoint_at_train_end(cfg, iteration=2)
+
+    def test_does_not_save_at_train_end_without_checkpoint_dir(self):
+        cfg = self._cfg(save=None, save_interval=3)
+
+        assert not _should_save_checkpoint_at_train_end(cfg, iteration=2)
+
+    def test_does_not_save_at_train_end_when_training_is_skipped(self):
+        cfg = self._cfg(skip_train=True, save_interval=3)
+
+        assert not _should_save_checkpoint_at_train_end(cfg, iteration=2)
 
 
 class TestSaveGrads:

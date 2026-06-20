@@ -1024,6 +1024,19 @@ def preprocess_common_state_dict(common_state_dict):
                     reorder_inner_param_groups(optimizer_state_dict[i])
 
     return preprocessed_common_state_dict
+def _should_save_checkpoint_at_train_end(cfg_container, iteration):
+    """Return whether training shutdown should write a final persistent checkpoint."""
+    checkpoint = cfg_container.checkpoint
+    return (
+        not cfg_container.validation.skip_train
+        and checkpoint.save
+        and not checkpoint.no_final_save
+        and iteration != 0
+        and checkpoint.save_interval
+        and iteration % checkpoint.save_interval != 0
+    )
+
+
 
 
 def pretrain(
@@ -1398,7 +1411,7 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
+        if _should_save_checkpoint_at_train_end(cfg_container, iteration):
             save_checkpoint_and_time(
                 iteration,
                 model,
